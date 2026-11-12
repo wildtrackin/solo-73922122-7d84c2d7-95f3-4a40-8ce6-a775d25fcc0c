@@ -91,6 +91,34 @@ python scripts/demo_concurrent.py http://localhost:8000
 
 也可直接在浏览器打开 http://localhost:8000/ 点击「并发读取全部 8 回路」。
 
+### 在 `/docs` 中演示「采集 → 超时 → 恢复调用」
+
+交互式文档 http://localhost:8000/docs 的 `GET /read/{circuit}` 已内置成功与
+`504 timeout` 示例，可直接 **Try it out** 复现完整恢复过程：
+
+```bash
+# 1) 正常采集
+curl http://localhost:8000/read/0
+
+# 2) 让模拟控制器接收变慢（每笔应答延迟 2.5s，超过 2s 超时）
+curl -X POST localhost:8081/mode -H 'Content-Type: application/json' \
+  -d '{"delay_seconds":2.5}'
+
+# 3) 再采集：约 2 秒返回 504；采集端关闭该连接、释放发送锁
+curl -i http://localhost:8000/read/0
+# HTTP/1.1 504 ...
+# {"error":"timeout","message":"采集失败：寄存器 0 读取超时（2s 未响应）"}
+
+# 4) 控制器恢复正常
+curl -X POST localhost:8081/reset
+
+# 5) 再次采集：自动重连，立即恢复 200（无需重启采集服务）
+curl http://localhost:8000/read/0
+```
+
+> 即使卡在 `drain()`（控制器不接收），第 3 步也会在 2 秒整失败而不是无限挂起；
+> 拆除连接后被占住的发送锁随之释放，其他回路不再被拖死。
+
 ## 四、关键设计：如何避免并发采样串值
 
 核心实现见 `app/modbus_client.py`。
@@ -103,12 +131,19 @@ python scripts/demo_concurrent.py http://localhost:8000
    因此控制器倒序回复也不会串值。
 4. **逐字段核对**：校验协议标识符（=0）、单元标识符（=1）、功能码（=0x03）、
    字节计数（=2）与正文长度；功能码最高位置位时按 Modbus 异常响应报采集失败。
-5. **2 秒超时**：每笔请求 `wait_for(..., timeout=2.0)`；超时即判失败并**拆除整条
-   连接**，使该连接上其余在途读取一并失败。迟到响应因 TID 已回收而被直接丢弃，
-   绝不用于后续采样。
-6. **断线与代际隔离**：连接断开后下一次调用自动重连。每代连接带 `generation`
-   编号，旧连接读取循环收到的残余报文会因代际不符被丢弃，无法干扰新连接。
-7. **不缓存**：无任何读数缓存，寄存器值变化在下一次调用立即可见。
+5. **2 秒超时（从写出请求起算，覆盖 drain 与等待应答）**：超时窗口在调用
+   `writer.write` 写出请求那一刻开始，用同一个截止时刻先后约束 `drain()` 与
+   应答等待——即使 `drain()` 因控制器接收过慢而长时间阻塞，也会按时失败，
+   不会占住发送锁把其他回路的采样一起挂死。超时即关闭**所属代连接**、释放
+   发送锁，使该连接上其余在途读取一并失败；下一次调用自动重连。触发拆除的
+   请求自身抛出准确的 `timeout` 错误，不被连接拆除的统一异常反向覆盖。
+6. **代际隔离，旧任务不碰新连接**：连接断开后下一次调用自动重连，每代连接带
+   `generation` 编号。旧连接的 drain 迟到完成/迟到报错、旧读取循环的残余事件，
+   都带着旧代际，代际不符的拆除动作一律忽略——既不会关闭新连接，也不会清掉
+   新连接上的待响应请求；旧连接收到的残余报文同样按代际丢弃。
+7. **发送期取消无残留**：在持锁、drain 过程中被取消时，必定清掉自身待响应项、
+   释放发送锁并关闭所属代连接，不遗留待响应项、不遗留被占住的发送锁。
+8. **不缓存**：无任何读数缓存，寄存器值变化在下一次调用立即可见。
 
 ## 五、模拟控制器与故障注入
 
@@ -167,7 +202,8 @@ python -m simulator.app
 MODBUS_HOST=127.0.0.1 MODBUS_PORT=5020 \
   uvicorn app.main:app --reload --port 8000
 
-# 测试（26 个用例，覆盖流水线/乱序/分片粘包/超时/断线/代际隔离/异常响应）
+# 测试（36 个用例，覆盖流水线/乱序/分片粘包/超时/drain 阻塞/发送取消/
+# 旧发送任务迟到/断线/代际隔离/异常响应）
 pytest -q
 ```
 
@@ -195,7 +231,10 @@ pytest -q
 │   └── static/index.html    # 演示页面
 ├── simulator/app.py         # 本地模拟控制器（Modbus + 故障注入 API）
 ├── scripts/demo_concurrent.py
-├── tests/                   # 26 个 pytest 用例
+├── tests/
+│   ├── test_modbus_client.py          # 协议/并发/超时/断线/代际隔离
+│   ├── test_api.py                    # FastAPI 接口与错误映射
+│   └── test_timeout_drain_cancel.py   # drain 阻塞/发送取消/旧任务迟到回归
 ├── Dockerfile
 └── docker-compose.yml
 ```

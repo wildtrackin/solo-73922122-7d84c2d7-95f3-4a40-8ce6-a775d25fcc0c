@@ -99,10 +99,30 @@ app = FastAPI(
     title="冷库温度采集 API",
     description=(
         "单进程 Modbus TCP 采集服务。所有请求共用一条 TCP 连接，支持多笔读取"
-        "同时在途（流水线）、乱序响应匹配、2 秒超时与断线自动重连，读数不缓存。"
+        "同时在途（流水线）、乱序响应匹配、2 秒超时与断线自动重连，读数不缓存。\n\n"
+        "## 快速演示\n\n"
+        "1. 正常采集：`GET /read/all`（8 回路流水线在途）或 `GET /read/{circuit}`。\n"
+        "2. 制造控制器接收变慢：向模拟控制器控制 API 发送\n"
+        "   `POST http://localhost:8081/mode`，体 `{\"delay_seconds\": 2.5}`。\n"
+        "3. 此时再调用 `GET /read/0`：约 **2 秒**后返回 `504 timeout`，"
+        "采集端会关闭该连接以释放发送锁，在途读取一并失败。\n"
+        "4. 恢复控制器：`POST http://localhost:8081/reset`。\n"
+        "5. 再次调用 `GET /read/0`：**自动重连**成功返回 200，无需重启服务。\n\n"
+        "超时窗口从请求写出（`writer.write`）起算，覆盖 drain 与等待应答，"
+        "drain 阻塞同样会按时失败；旧连接的迟到事件按连接代际隔离，不影响新连接。"
     ),
     version="1.0.0",
     lifespan=lifespan,
+    openapi_tags=[
+        {
+            "name": "采集",
+            "description": "实时 Modbus 采集入口。每次调用都发起真实寄存器读取，不缓存。",
+        },
+        {
+            "name": "运维",
+            "description": "健康检查等运维端点。",
+        },
+    ],
 )
 
 
@@ -142,6 +162,7 @@ async def _collect_one(circuit: int) -> BatchItem:
 @app.get(
     "/read/all",
     response_model=BatchResponse,
+    tags=["采集"],
     summary="并发读取全部回路（0~7）当前温度",
 )
 async def read_all() -> BatchResponse:
@@ -155,6 +176,7 @@ async def read_all() -> BatchResponse:
 @app.post(
     "/read/batch",
     response_model=BatchResponse,
+    tags=["采集"],
     summary="并发读取指定回路列表",
 )
 async def read_batch(body: BatchRequest) -> BatchResponse:
@@ -167,11 +189,63 @@ async def read_batch(body: BatchRequest) -> BatchResponse:
 @app.get(
     "/read/{circuit}",
     response_model=Reading,
+    tags=["采集"],
     summary="读取单个回路当前温度",
-    responses={502: {"model": ErrorBody}, 504: {"model": ErrorBody}},
+    responses={
+        200: {
+            "description": "采集成功",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "circuit": 0,
+                        "address": 0,
+                        "temperature_c": -18.0,
+                        "raw_register": -180,
+                        "received_at": "2026-11-12T04:13:03.376+00:00",
+                    }
+                }
+            },
+        },
+        504: {
+            "model": ErrorBody,
+            "description": (
+                "2 秒超时。超时窗口从请求写出起算并覆盖 drain 与等待应答；"
+                "采集端会关闭该连接、释放发送锁，下一次调用自动重连。"
+                "恢复控制器后重新调用本接口即可成功。"
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "timeout",
+                        "message": "采集失败：寄存器 0 读取超时（2s 未响应）",
+                    }
+                }
+            },
+        },
+        502: {
+            "model": ErrorBody,
+            "description": "连接断开/无法连接/异常响应等；断线后下一次调用自动重连。",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "connection_lost",
+                        "message": "采集失败：控制器关闭了连接（断线）",
+                    }
+                }
+            },
+        },
+    },
 )
 async def read_circuit(circuit: int) -> Reading:
-    """对 unit=1 的保持寄存器 ``circuit`` 执行功能码 03 单寄存器读取。"""
+    """对 unit=1 的保持寄存器 ``circuit`` 执行功能码 03 单寄存器读取。
+
+    ## 超时后恢复调用示例
+
+    1. 控制器接收变慢（模拟：`POST :8081/mode` 体 `{"delay_seconds": 2.5}`）。
+    2. 调用本接口 → 约 2 秒返回 `504 timeout`，连接被拆除、发送锁释放。
+    3. 控制器恢复（模拟：`POST :8081/reset`）。
+    4. 再次调用本接口 → 自动建立新连接，返回 `200` 与最新温度。
+    """
     _validate_circuit(circuit)
     try:
         raw, _ = await client.read_holding_register(circuit)
@@ -198,7 +272,7 @@ def _build_batch(items: tuple[BatchItem, ...] | list[BatchItem]) -> BatchRespons
     )
 
 
-@app.get("/health", summary="健康检查")
+@app.get("/health", tags=["运维"], summary="健康检查")
 async def health() -> dict:
     return {"status": "ok", "controller": f"{settings.modbus_host}:{settings.modbus_port}"}
 

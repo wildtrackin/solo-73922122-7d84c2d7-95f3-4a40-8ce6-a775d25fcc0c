@@ -7,8 +7,15 @@
   仅用一把短临界区锁串行化“写 socket + drain”动作，不限制在途请求数量。
 * 严格校验 MBAP 头与响应内容，按事务标识符（TID）匹配请求，天然支持乱序响应；
   TID 仅在请求完成/失败后才回收复用，迟到且找不到归属 TID 的报文一律丢弃。
-* 每笔请求发出后 2 秒（可配置）未收到响应即失败，并强制拆除整条连接，
-  使该连接上其余在途读取一并失败。
+* 每笔请求的超时窗口从调用 ``writer.write`` 写出请求那一刻起算，统一覆盖
+  「drain 发送缓冲」与「等待应答」两个阶段；即使 ``drain()`` 长时间阻塞也会
+  按时失败，不会把发送锁和其他回路的采样一起挂死。
+* 发送/应答超时或发送期间被取消，都会关闭**所属代（generation）**的连接：
+  在途读取随之失败、发送锁得以释放，下一次调用自动重连。
+* 旧连接的 drain 迟到完成或迟到报错只作用于它自己那一代连接：代际不符的
+  拆除动作一律忽略，既不会关闭新连接，也不会清掉新连接上的待响应请求。
+* 发送期间（持锁、drain 中）被取消时，必定清掉自身待响应项、释放发送锁并
+  关闭所属连接，不遗留待响应项、不遗留被占住的发送锁。
 * 连接断开后下一次调用自动重连；每代连接带 generation 编号，旧连接的读取循环
   即使收到残余报文也无法触碰新连接的待响应表，实现旧任务与新连接完全隔离。
 * 不缓存任何读数，每次调用都发起真实的寄存器读取。
@@ -66,6 +73,17 @@ class _Pending:
     sent_at: float
 
 
+def _consume_future_exception(future: asyncio.Future) -> None:
+    """消费 future 上无人 await 的异常，避免事件循环的未检索异常告警。"""
+    if future.done() and not future.cancelled():
+        with contextlib.suppress(Exception):
+            future.exception()
+
+
+# 持有后台回收任务的强引用，防止被垃圾回收中途消失。
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
 class ModbusTcpClient:
     """单连接、支持并发在途读取的 Modbus TCP 主站。"""
 
@@ -111,35 +129,78 @@ class ModbusTcpClient:
 
         await self._ensure_connected()
 
-        tid = self._alloc_tid()
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[int] = loop.create_future()
-        pending = _Pending(
-            tid=tid,
-            generation=self._generation,
-            future=future,
-            sent_at=loop.time(),
-        )
-        request = self._build_request(tid, address)
 
         async with self._write_lock:
             # 持锁期间再次确认连接仍然有效（可能刚刚被其他任务拆除）。
             if self._writer is None or self._writer.is_closing():
-                self._release_tid(tid)
                 raise ModbusError(
                     ModbusErrorCode.CONNECTION_LOST,
                     "采集失败：连接已断开，正在等待自动重连",
                 )
+
+            # TID 分配、待响应登记与请求构造都放在锁内：保证并发请求拿到互不
+            # 相同的 TID。若在锁外分配，多笔并发请求会撞到同一个 TID，在拆除/
+            # 重连路径上互相串台（owner_tid 误匹配、待响应项被错误清理）。
+            tid = self._alloc_tid()
+            future: asyncio.Future[int] = loop.create_future()
+            # 本笔请求所属的连接代。后续任何清理都必须核对代际，
+            # 防止旧连接的迟到事件误关新连接、误清新请求。
+            generation = self._generation
+            pending = _Pending(
+                tid=tid,
+                generation=generation,
+                future=future,
+                sent_at=loop.time(),
+            )
+            request = self._build_request(tid, address)
             self._pending[tid] = pending
+
+            # 超时窗口从“写出请求”这一刻起算，覆盖 drain 与等待应答全程；
+            # drain 若长期阻塞也会在同一截止时刻失败，不会占住发送锁挂死他人。
+            deadline = loop.time() + self._timeout
+            self._writer.write(request)
             try:
-                self._writer.write(request)
-                await self._writer.drain()
+                # drain 可能因对端不接收而长期阻塞，必须受同一超时约束。
+                await asyncio.wait_for(
+                    self._writer.drain(),
+                    timeout=max(0.0, deadline - loop.time()),
+                )
+            except asyncio.CancelledError:
+                # 必须先于 TimeoutError 捕获：超时与任务取消同时发生时，
+                # wait_for 取消 drain 的瞬间可能把 CancelledError 抛给本任务，
+                # 此时按“发送期间取消”处理，而不是误判成超时/连接断开。
+                # 关闭所属代连接（代际核对，避免误伤新连接），随后原样向上抛，
+                # 不遗留待响应项、不占住发送锁。
+                await self._tear_down(
+                    ModbusErrorCode.CONNECTION_LOST,
+                    "采集失败：发送请求期间调用被取消，连接已关闭等待重连",
+                    generation=generation,
+                    owner_tid=tid,
+                )
+                raise
+            except asyncio.TimeoutError:
+                # 发送（drain）阶段超时：按超时失败并拆除所属代连接，
+                # 释放发送锁，使在途读取失败、后续调用自动重连。
+                await self._tear_down(
+                    ModbusErrorCode.TIMEOUT,
+                    f"采集失败：事务 {tid} 发送 {self._timeout:g} 秒仍未排空"
+                    "（drain 阻塞，控制器接收过慢）",
+                    generation=generation,
+                    owner_tid=tid,
+                )
+                raise ModbusError(
+                    ModbusErrorCode.TIMEOUT,
+                    f"采集失败：寄存器 {address} 读取超时（{self._timeout:g}s 未响应）",
+                ) from None
             except (ConnectionError, RuntimeError, OSError) as exc:
-                self._pending.pop(tid, None)
-                self._release_tid(tid)
+                # drain 迟到报错同样只作用于所属代连接；若该代已被拆除
+                # （_tear_down 内部代际不符直接忽略），不得波及新连接。
                 await self._tear_down(
                     ModbusErrorCode.CONNECTION_LOST,
                     f"采集失败：发送请求时连接断开（{exc.__class__.__name__}）",
+                    generation=generation,
+                    owner_tid=tid,
                 )
                 raise ModbusError(
                     ModbusErrorCode.CONNECTION_LOST,
@@ -147,21 +208,28 @@ class ModbusTcpClient:
                 ) from exc
 
         try:
-            raw_value = await asyncio.wait_for(future, timeout=self._timeout)
+            # 等待应答使用同一个截止时刻：总预算（write 起 2s）不随阶段重置。
+            raw_value = await asyncio.wait_for(
+                future, timeout=max(0.0, deadline - loop.time())
+            )
         except asyncio.TimeoutError:
-            # 2 秒未响应：本笔失败，拆除整条连接，其余在途读取一并失败。
+            # 2 秒未响应：本笔失败，拆除所属代连接，其余在途读取一并失败。
             await self._tear_down(
                 ModbusErrorCode.TIMEOUT,
                 f"采集失败：事务 {tid} 发出后 {self._timeout:g} 秒未收到响应",
+                generation=generation,
+                owner_tid=tid,
             )
             raise ModbusError(
                 ModbusErrorCode.TIMEOUT,
                 f"采集失败：寄存器 {address} 读取超时（{self._timeout:g}s 未响应）",
             ) from None
         except asyncio.CancelledError:
-            # 调用方取消时清理自身在途条目，不影响其他请求。
-            self._pending.pop(tid, None)
-            self._release_tid(tid)
+            # 调用方在等待应答期间取消：仅清理自身在途条目，不影响其他请求，
+            # 同样核对代际，绝不触碰新连接的待响应表。
+            if self._generation == generation:
+                self._pending.pop(tid, None)
+                self._release_tid(tid)
             raise
         else:
             self._release_tid(tid)
@@ -205,8 +273,27 @@ class ModbusTcpClient:
                 name=f"modbus-reader-gen{generation}",
             )
 
-    async def _tear_down(self, code: ModbusErrorCode, message: str) -> None:
-        """拆除当前连接，并让其上全部在途读取失败。"""
+    async def _tear_down(
+        self,
+        code: ModbusErrorCode,
+        message: str,
+        generation: int | None = None,
+        owner_tid: int | None = None,
+    ) -> None:
+        """拆除当前连接，并让其上全部在途读取失败。
+
+        ``generation`` 给定时仅当它仍是当前连接代才执行拆除。旧连接的 drain
+        迟到完成/报错或旧任务异常会带着旧代际调用本方法，此时直接忽略，
+        保证新连接与新连接上的待响应请求不被触碰。``generation=None`` 表示
+        不做代际核对（应用停机等无条件拆除场景）。
+
+        ``owner_tid`` 是触发本次拆除的那笔请求自身的 TID：它的 future 不在此
+        置失败，由所属任务自行抛出准确错误（超时/连接断开/取消），避免被这里
+        统一设置的异常经 ``wait_for`` 反向覆盖成别的错误码。
+        """
+        if generation is not None and generation != self._generation:
+            return
+
         reader_task = self._reader_task
         writer = self._writer
         pending_items = list(self._pending.items())
@@ -216,8 +303,14 @@ class ModbusTcpClient:
 
         for tid, item in pending_items:
             self._release_tid(tid)
+            if tid == owner_tid:
+                # 触发拆除的任务自己负责报错，跳过它的 future。
+                continue
             if not item.future.done():
                 item.future.set_exception(ModbusError(code, message))
+                # 防御性消费：确保任何无人 await 的异常都不会触发事件循环的
+                # “exception was never retrieved”告警；对正常 await 的 future 无副作用。
+                item.future.add_done_callback(_consume_future_exception)
 
         # 显式关闭本代 socket，不能依赖 _close_writer（self._writer 已置空）。
         if writer is not None:
@@ -226,9 +319,26 @@ class ModbusTcpClient:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
         if reader_task is not None:
+            # 取消读取循环，但绝不在触发拆除的任务里直接 await 它：await 一个被
+            # cancel 的任务会把 CancelledError 重新投递进当前任务（3.11 uncancel
+            # 计数），把本应抛出的准确错误（如 TIMEOUT）顶掉。改为后台任务吸收
+            # 其结束：读取循环退出路径已带代际核对，旧 reader 不会触碰新连接，
+            # socket 关闭也会让其 readexactly 尽快返回。
             reader_task.cancel()
+            self._drain_reader_task(reader_task)
+
+    def _drain_reader_task(self, reader_task: asyncio.Task) -> None:
+        """在后台等待被取消的读取循环结束，避免任务悬挂与未检索异常。
+
+        与触发拆除的调用解耦：不把 CancelledError 投递回业务任务。
+        """
+        async def _absorb() -> None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await reader_task
+
+        task = asyncio.create_task(_absorb(), name="modbus-reader-reap")
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     async def _close_writer(self) -> None:
         writer = self._writer
