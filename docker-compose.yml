@@ -1,0 +1,42 @@
+services:
+  # 本地模拟 Modbus TCP 控制器：5020 提供 Modbus，8081 提供故障注入控制 API
+  simulator:
+    build: .
+    image: coldchain-modbus:latest
+    command: ["python", "-m", "simulator.app"]
+    ports:
+      - "5020:5020"
+      - "8081:8081"
+    environment:
+      # 初始寄存器（有符号整数，实际温度 = 值 / 10）
+      REGISTER_VALUES: "-180,-175,50,235,-200,300,-45,105"
+      REPLY_MODE: "normal"
+      DELAY_SECONDS: "0"
+      DISCONNECT_MODE: "none"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0 if socket.create_connection(('127.0.0.1',5020),2) else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 单进程采集 API：FastAPI，所有调用共用一条到 simulator:5020 的 TCP 连接
+  collector:
+    build: .
+    image: coldchain-modbus:latest
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      MODBUS_HOST: "simulator"
+      MODBUS_PORT: "5020"
+      MODBUS_UNIT_ID: "1"
+      MODBUS_TIMEOUT_SECONDS: "2"
+      REGISTER_COUNT: "8"
+    depends_on:
+      simulator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

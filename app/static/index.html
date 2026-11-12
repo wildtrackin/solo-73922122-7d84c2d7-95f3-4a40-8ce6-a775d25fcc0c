@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>冷库温度采集演示</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0;
+          --ok:#22c55e; --bad:#ef4444; --accent:#38bdf8; --warn:#f59e0b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:var(--txt); padding:24px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:#94a3b8; font-size:13px; margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; max-width:1180px; }
+  @media (max-width:900px){ .grid{grid-template-columns:1fr;} }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:15px; margin:0 0 12px; color:var(--accent); }
+  button { background:var(--accent); color:#082f49; border:0; border-radius:8px;
+           padding:8px 14px; font-weight:600; cursor:pointer; margin:0 8px 8px 0; font-size:13px; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button.warn  { background:var(--warn); color:#422006; }
+  button.danger{ background:var(--bad); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+  th { color:#94a3b8; font-weight:500; }
+  .ok  { color:var(--ok); font-weight:600; }
+  .bad { color:var(--bad); font-weight:600; }
+  .log { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px;
+         background:#0b1220; border:1px solid var(--line); border-radius:8px;
+         padding:10px; height:300px; overflow:auto; white-space:pre-wrap; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; }
+  .pill.normal { background:rgba(34,197,94,.15); color:var(--ok); }
+  .pill.fault  { background:rgba(239,68,68,.15); color:var(--bad); }
+  code { color:var(--accent); }
+</style>
+</head>
+<body>
+<h1>❄️ 冷库温度采集演示（Modbus TCP / 功能码 03）</h1>
+<div class="sub">
+  单进程 FastAPI 采集服务 · 全调用共用一条 TCP 连接 · 多笔读取流水线在途 ·
+  乱序按 TID 匹配 · 2 秒超时 · 断线自动重连 · 读数不缓存。
+  交互式文档见 <a href="/docs" style="color:var(--accent)">/docs</a>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>采集操作</h2>
+    <button onclick="readOne()">读取回路 3（GET /read/3）</button>
+    <button onclick="readAll()">⚡ 并发读取全部 8 回路（GET /read/all）</button>
+    <button class="ghost" onclick="clearAll()">清空结果</button>
+    <table style="margin-top:8px">
+      <thead><tr><th>回路</th><th>温度 ℃</th><th>原始值</th><th>接收时间(UTC)</th><th>状态</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="5" style="color:#64748b">尚未采集</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>模拟控制器故障注入（控制 API :8081）</h2>
+    <button class="warn" onclick="setMode('reverse')">倒序回复</button>
+    <button class="warn" onclick="setDelay(2.5)">延迟 2.5s（触发 2s 超时）</button>
+    <button class="warn" onclick="setDelay(0.3)">延迟 0.3s（不超时）</button>
+    <button class="danger" onclick="disconnect('next')">下一笔后断线</button>
+    <button class="danger" onclick="disconnect('all')">新连接立即断线</button>
+    <button class="danger" onclick="injectException()">注入异常响应（回路 2 × 2 次）</button>
+    <button class="ghost" onclick="resetSim()">恢复正常</button>
+    <p style="font-size:12px;color:#94a3b8">
+      注入故障后回到左侧重新采集：倒序模式下结果仍按 TID 正确匹配；
+      延迟 2.5s 时每笔请求 2 秒后失败（504）；断线后首笔失败（502），
+      再次点击即可验证自动重连成功。
+    </p>
+    <h2 style="margin-top:14px">调用日志</h2>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+const rowsEl = document.getElementById('rows');
+const logEl  = document.getElementById('log');
+function log(msg, ok=true) {
+  const t = new Date().toISOString().slice(11,23);
+  logEl.textContent += `[${t}] ${ok ? '✓' : '✗'} ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function clearAll(){ rowsEl.innerHTML = '<tr><td colspan="5" style="color:#64748b">尚未采集</td></tr>'; }
+
+function rowHtml(item){
+  if (item.ok && item.data) {
+    const d = item.data;
+    return `<tr><td>${d.circuit}</td><td class="ok">${d.temperature_c.toFixed(2)} ℃</td>
+      <td>${d.raw_register}</td><td>${d.received_at.slice(11,23)}</td>
+      <td><span class="pill normal">成功</span></td></tr>`;
+  }
+  return `<tr><td>${item.circuit}</td><td colspan="3" class="bad">${item.message ?? '采集失败'}</td>
+    <td><span class="pill fault">失败 ${item.error ?? ''}</span></td></tr>`;
+}
+
+async function readOne(){
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/read/3');
+    const body = await r.json();
+    const ms = (performance.now()-t0).toFixed(0);
+    if (!r.ok) throw new Error(body.message || r.statusText);
+    rowsEl.innerHTML = [rowHtml({ok:true, data:body})].join('');
+    log(`单回路读取成功：回路3 = ${body.temperature_c}℃，耗时 ${ms}ms`);
+  } catch (e) {
+    rowsEl.innerHTML = rowHtml({circuit:3, ok:false, message:e.message, error:''});
+    log(`单回路读取失败：${e.message}`, false);
+  }
+}
+
+async function readAll(){
+  const t0 = performance.now();
+  // 8 笔读取在服务端通过同一连接并发在途发送（流水线）
+  const r = await fetch('/read/all');
+  const body = await r.json();
+  const ms = (performance.now()-t0).toFixed(0);
+  rowsEl.innerHTML = body.results.map(rowHtml).join('');
+  log(`并发采集 8 回路完成：成功 ${body.success_count} / 失败 ${body.failure_count}，总耗时 ${ms}ms`);
+  body.results.forEach(i => { if(!i.ok) log(`  回路${i.circuit}：${i.message}`, false); });
+}
+
+async function control(path, payload){
+  const r = await fetch(`http://${location.hostname}:8081${path}`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  return r.json();
+}
+async function setMode(m){ await control('/mode',{reply_mode:m}); log(`模拟器切换为${m==='reverse'?'倒序':'正常'}回复模式`); }
+async function setDelay(s){ await control('/mode',{delay_seconds:s}); log(`模拟器回复延迟设为 ${s}s`); }
+async function disconnect(mode){ await control('/disconnect',{mode}); log(`已触发断线模式：${mode}`); }
+async function injectException(){ await control('/exception',{address:2,code:2,count:2}); log('已对回路2注入2次异常码02响应'); }
+async function resetSim(){
+  await control('/reset',{});
+  log('模拟器已恢复正常模式');
+}
+</script>
+</body>
+</html>
